@@ -1,6 +1,8 @@
 # COD: Conditional Operator Discrepancy
 Code release for our paper COD: Learning Conditional Invariant Representation for Domain Adaptation Regression (ECCV 2024)
 
+Code will come soon
+
 # Overview
 Conditional Operator Discrepancy (COD) is a metric defined for characterizing the discrepancy between conditional distributions, especially for those with continuous conditioning variable. An important application scenario is Domain Adaptation Regression, in which the key problem is the measurement of conditional distribution shift with continuous label variables.
 
