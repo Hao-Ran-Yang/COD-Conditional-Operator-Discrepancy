@@ -20,7 +20,7 @@ parser = argparse.ArgumentParser(description='PyTorch CKW experiment')
 
 parser.add_argument('--seed', type=int, default=0, help='random seed')
 parser.add_argument('--gpu_id', type=str, nargs='?', default='0', help="device id to run")
-parser.add_argument('--dset_name', type=str, default='MPI3D', metavar='S', help='name of the dataset: dSprites, MPI3D or BK')
+parser.add_argument('--dset_name', type=str, default='dSprites', metavar='S', help='name of the dataset: dSprites, MPI3D or BK')
 parser.add_argument('--marg', type=str, default='daregram', metavar='S', help='name of the marginal loss: daregram, rsd, kgw or any other')
 parser.add_argument('--src', type=str, default='c', metavar='S', help='source dataset')
 parser.add_argument('--tgt', type=str, default='n', metavar='S', help='target dataset')
@@ -28,7 +28,7 @@ parser.add_argument('--tgt', type=str, default='n', metavar='S', help='target da
 parser.add_argument('--lr', type=float, default=1e-1, help='init learning rate for fine-tune')
 parser.add_argument('--gamma', type=float, default=0.0001, help='learning rate decay')
 parser.add_argument('--epsilon', type=float, default=5e-2, help='regularization for kernel matrix inversion')
-parser.add_argument('--warmup_num', type=int, default=8000, help='before this threshold, marginal only; after, conditional only')
+parser.add_argument('--warmup_num', type=int, default=5000, help='before this threshold, marginal only; after, marginal and conditional')
 
 parser.add_argument('--tradeoff_angle', type=float, default=0.1,
                         help='tradeoff for angle alignment')
@@ -138,7 +138,7 @@ class label_transforms:
             label3 = label[2]
             label4 = label[3]
             label = np.stack((label1,label3,label4))
-            label = torch.tensor(label)
+            label = torch.tensor(label, dtype=float)
 
         return label
 
@@ -197,7 +197,7 @@ def inv_lr_scheduler(param_lr, optimizer, iter_num, gamma, power, init_lr=0.001,
         i += 1
     return optimizer
 
-def mul_guassian_kernel(source, target, kernel_mul=2.0, kernel_num=5): # 混合5个guassian kernel
+def mul_guassian_kernel(source, target, kernel_mul=2.0, kernel_num=5): 
     batch_size = int(source.size()[0])
     n_samples = int(source.size()[0])+int(target.size()[0])
     total = torch.cat([source, target], dim=0)
@@ -235,23 +235,24 @@ def COD_Metric(fea_s, fea_t, prob_s, prob_t, device, epsilon=5e-2):
     K_YsYs, K_YtYt, K_YsYt, K_YtYs = mul_guassian_kernel(prob_s, prob_t)
 
     #################################### CMMD ########################################
-    Inv_K_YsYs = ((K_YsYs.mm(K_YsYs) + epsilon * I_s).inverse()).mm(K_YsYs) # 但效果比较好
-    Inv_K_YtYt = ((K_YtYt.mm(K_YtYt) + epsilon * I_t).inverse()).mm(K_YtYt) # 条件数6-8位数，真实标签时也会炸，并不稳定
-
-    # Inv_K_YsYs = (epsilon *I_s + K_YsYs).inverse() # 条件数3位数
+    # Inv_K_YsYs = (epsilon *I_s + K_YsYs).inverse() 
     # Inv_K_YtYt = (epsilon* I_t + K_YtYt).inverse()
+
+    Inv_K_YsYs = ((K_YsYs.mm(K_YsYs) + epsilon * I_s).inverse()).mm(K_YsYs) # another kind of regularization
+    Inv_K_YtYt = ((K_YtYt.mm(K_YtYt) + epsilon * I_t).inverse()).mm(K_YtYt) 
 
     C_t = ((K_YtYt.mm(Inv_K_YtYt)).mm(K_ZtZt)).mm(Inv_K_YtYt)
     C_s = ((K_YsYs.mm(Inv_K_YsYs)).mm(K_ZsZs)).mm(Inv_K_YsYs)
     C_st = ((K_YtYs.mm(Inv_K_YsYs)).mm(K_ZsZt)).mm(Inv_K_YtYt)
 
+    CMMD_dist =  (-1) * torch.sqrt((C_s.trace() + C_t.trace() + 2 * C_st.trace()))
     #################################### CKB ######################################## 
     G_Ys = (H_s.mm(K_YsYs)).mm(H_s)
     G_Yt = (H_t.mm(K_YtYt)).mm(H_t)
     G_Zs = (H_s.mm(K_ZsZs)).mm(H_s)
     G_Zt = (H_t.mm(K_ZtZt)).mm(H_t)
     #====== R_{s} and R_{t} =======
-    Inv_s = (epsilon*num_sam_s*I_s + G_Ys).inverse()#条件数3位数
+    Inv_s = (epsilon*num_sam_s*I_s + G_Ys).inverse() 
     Inv_t = (epsilon*num_sam_t*I_t + G_Yt).inverse()
 
     R_s = epsilon*G_Zs.mm(Inv_s)
@@ -263,23 +264,19 @@ def COD_Metric(fea_s, fea_t, prob_s, prob_t, device, epsilon=5e-2):
     B_s = (B_s + B_s.t())/2 # numerical symmetrize
     B_t = (B_t + B_t.t())/2 # numerical symmetrize
 
-    ##################### some regulization ######################
-    # #特征归一化
-    nBs = torch.norm(B_s, p = 2, dim = 1, keepdim=True).detach()
-    nBt = torch.norm(B_t, p = 2, dim = 1, keepdim=True).detach()
-    eB_s = B_s / nBs
-    eB_t = B_t / nBt
+    S_s, U_s = torch.linalg.eigh(B_s)
+    S_t, U_t = torch.linalg.eigh(B_t)
 
-    S_s, U_s = torch.linalg.eigh(eB_s)
-    S_t, U_t = torch.linalg.eigh(eB_t)
+    # S_sn = (S_s+1e-4).pow(0.5).diag()
+    # S_tn = (S_t+1e-4).pow(0.5).diag()
+
+    #====== optional; some regulization for eigh =======
     if torch.isnan(S_s[0]):
         S_s[0] = 0
     if torch.isnan(S_t[0]):
         S_t[0] = 0
     Ss = torch.maximum(S_s, torch.zeros(S_s.size()).to(device))
     St = torch.maximum(S_t, torch.zeros(S_t.size()).to(device))
-    ##################### some regulization ######################
-
     S_sn = (Ss+1e-4).pow(0.5).diag()
     S_tn = (St+1e-4).pow(0.5).diag()
 
@@ -289,7 +286,6 @@ def COD_Metric(fea_s, fea_t, prob_s, prob_t, device, epsilon=5e-2):
 
     S_n = torch.linalg.svdvals(Nuclear)    
     
-    CMMD_dist =  (-1) * torch.sqrt((C_s.trace() + C_t.trace() + 2 * C_st.trace()))
     CKB_dist = (R_s.trace() + R_t.trace() - 2*S_n[:-1].sum()/((num_sam_s*num_sam_t)**0.5))
 
     return CMMD_dist + CKB_dist
@@ -449,8 +445,6 @@ for exp_iter in {1}: #range(1,10):
     iter_target = iter(dataset_loader["target_train"])
 
     train_distribution_matching_loss = train_task_loss = train_total_loss = 0.0
-    current_best_mae = 1.0
-    best_iter = 1
     MSE_loss = nn.MSELoss()
 
     print(args)
@@ -479,10 +473,10 @@ for exp_iter in {1}: #range(1,10):
         
         feat_s, pred_s = Model_R(inputs_source)
         feat_t, pred_t = Model_R(inputs_target)
-        y_source = labels_source 
-        y_target = pred_t
+        # y_source = labels_source 
+        # y_target = pred_t
 
-        # optional; reduce the morbidity of kernel matrix
+        # optional; relieve the ill-posedness of kernel matrix inversion
         supp_source = (1e-3) * torch.rand(labels_source.shape[0],4).to(device)
         supp_target = (1e-3) * torch.rand(labels_target.shape[0],4).to(device)
         y_source = torch.cat((labels_source, supp_source),dim=1)
@@ -531,9 +525,6 @@ for exp_iter in {1}: #range(1,10):
             Model_R.eval()
             mae = Regression_test(dataset_loader["target_test"], Model_R)
             train_distribution_matching_loss = train_task_loss = train_total_loss = 0.0
-            if mae < current_best_mae:
-                current_best_mae = mae
-                best_iter = iter_num 
 
     end_time = datetime.now()
     seconds = (end_time - start_time).seconds
@@ -542,7 +533,6 @@ for exp_iter in {1}: #range(1,10):
     hours = minutes//60
     minute = minutes%60
     print("************ %1s→ %1s: %1s End Experiment %1s training ************"%(args.src, args.tgt, end_time, exp_iter))
-    print("current_best_mae: {}, achieved at {} batches".format(current_best_mae, best_iter))
     print('Total TIme Cost: {} Hour {} Minutes {} Seconds'.format(hours,minute,second))
 
 
